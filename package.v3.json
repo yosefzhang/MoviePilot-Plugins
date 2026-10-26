@@ -1,0 +1,15 @@
+{
+  "YosebenchWebhook": {
+    "name": "yosebench通知",
+    "description": "把 MoviePilot 通知转发到 yosebench 通知中心（Webhook）。",
+    "labels": "消息通知",
+    "version": "1.0.0",
+    "icon": "",
+    "author": "Yosef",
+    "level": 1,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v1.0.0": "首次发布：监听 NoticeMessage，把未指定专用渠道的通知转发到 yosebench webhook。"
+    }
+  }
+}
