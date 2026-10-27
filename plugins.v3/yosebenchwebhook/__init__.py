@@ -15,6 +15,15 @@ TYPE_LEVELS = {
     NotificationType.Manual: "warning",
 }
 
+# yosebench 图片接口：按文件内容只收这四种，单张默认上限 8 MiB
+IMAGE_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif",
+}
+IMAGE_MAX_BYTES = 8 * 1024 * 1024
+
 
 class YosebenchWebhook(_PluginBase):
     """yosebench Webhook 通知插件。
@@ -28,7 +37,7 @@ class YosebenchWebhook(_PluginBase):
     # 插件描述
     plugin_desc = "把 MoviePilot 通知转发到 yosebench 通知中心（Webhook）。"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "Yosef"
     # 作者主页
@@ -43,6 +52,7 @@ class YosebenchWebhook(_PluginBase):
     # 私有属性
     _enabled = False
     _webhook_url: Optional[str] = None
+    _image_key: Optional[str] = None
     _source = "moviepilot"
     _msgtypes: List[str] = []
 
@@ -51,6 +61,7 @@ class YosebenchWebhook(_PluginBase):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._webhook_url = (config.get("webhook_url") or "").strip() or None
+        self._image_key = (config.get("image_key") or "").strip() or None
         self._source = (config.get("source") or "").strip() or "moviepilot"
         self._msgtypes = config.get("msgtypes") or []
 
@@ -125,6 +136,28 @@ class YosebenchWebhook(_PluginBase):
                         "content": [
                             {
                                 "component": "VCol",
+                                "props": {"cols": 12},
+                                "content": [
+                                    {
+                                        "component": "VTextField",
+                                        "props": {
+                                            "model": "image_key",
+                                            "label": "yosebench 图片密钥（可选）",
+                                            "placeholder": "img_xxx",
+                                            "type": "password",
+                                            "hint": "填了才会把通知里的图片上传到 yosebench；留空只发文字。它与 Webhook 地址是两把不同的钥匙。",
+                                            "persistent-hint": True,
+                                        },
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                    {
+                        "component": "VRow",
+                        "content": [
+                            {
+                                "component": "VCol",
                                 "props": {"cols": 12, "md": 6},
                                 "content": [
                                     {
@@ -182,6 +215,7 @@ class YosebenchWebhook(_PluginBase):
         ], {
             "enabled": False,
             "webhook_url": "",
+            "image_key": "",
             "source": "moviepilot",
             "msgtypes": [],
         }
@@ -202,6 +236,71 @@ class YosebenchWebhook(_PluginBase):
             "metadata": {"type": msg_type.name} if msg_type else {},
         }
         return payload
+
+    def _images_url(self) -> Optional[str]:
+        """从 Webhook 地址推导图片上传接口：/notify/hook/<key> → /notify/images。"""
+        marker = "/notify/hook/"
+        url = self._webhook_url or ""
+        if marker not in url:
+            return None
+        return url.split(marker, 1)[0] + "/notify/images"
+
+    def _upload_image(self, source: Optional[str]) -> Optional[str]:
+        """把通知里的图片上传到 yosebench，返回带 token 的 URL。
+
+        任何一步失败都只丢图，通知照常发文字；日志不输出图片密钥和 token。
+        """
+        if not self._image_key or not source:
+            return None
+        if not source.startswith(("http://", "https://")):
+            return None
+
+        upload_url = self._images_url()
+        if not upload_url:
+            logger.warn("yosebench 图片上传失败：无法从 Webhook 地址推导出图片接口")
+            return None
+
+        try:
+            res = RequestUtils().get_res(source, allow_redirects=True)
+            if res is None or res.status_code != 200:
+                logger.warn(
+                    f"yosebench 图片上传失败：下载源图失败（{getattr(res, 'status_code', '无响应')}）"
+                )
+                return None
+            declared_size = res.headers.get("Content-Length") or "0"
+            if declared_size.isdigit() and int(declared_size) > IMAGE_MAX_BYTES:
+                logger.warn("yosebench 图片上传失败：源图超过 8 MiB")
+                return None
+            content = res.content or b""
+            content_type = (res.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            ext = IMAGE_TYPES.get(content_type)
+            if not ext:
+                logger.warn(f"yosebench 图片上传失败：不支持的类型 {content_type or '未知'}")
+                return None
+            if not content or len(content) > IMAGE_MAX_BYTES:
+                logger.warn("yosebench 图片上传失败：源图为空或超过 8 MiB")
+                return None
+
+            up = RequestUtils().post_res(
+                upload_url,
+                files={"file": (f"image.{ext}", content, content_type)},
+                headers={"X-Image-Key": self._image_key},
+                allow_redirects=False,
+            )
+            if up is None or up.status_code != 200:
+                logger.warn(
+                    f"yosebench 图片上传失败，HTTP 状态码：{getattr(up, 'status_code', '无响应')}"
+                )
+                return None
+            image_url = (up.json() or {}).get("url")
+            if isinstance(image_url, str) and image_url:
+                logger.info("yosebench 图片已上传")
+                return image_url
+            logger.warn("yosebench 图片上传失败：响应里没有 url")
+            return None
+        except Exception as err:
+            logger.warn(f"yosebench 图片上传异常，{err}")
+            return None
 
     def _send(self, payload: Dict[str, Any]) -> bool:
         """POST 到 yosebench，成功以响应 JSON status=ok 判定。
@@ -267,7 +366,11 @@ class YosebenchWebhook(_PluginBase):
             return
 
         try:
-            self._send(self._payload(msg_type, title, text))
+            payload = self._payload(msg_type, title, text)
+            image_url = self._upload_image(msg_body.get("image"))
+            if image_url:
+                payload["image"] = image_url
+            self._send(payload)
         except Exception as msg_e:
             logger.error(f"yosebench 通知发送异常，{str(msg_e)}")
 
